@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -548,17 +549,17 @@ func TestRESTPRWriteFollowsRepositoryRename(t *testing.T) {
 					response, _ := restWriteResponse(status, `{}`)
 					response.Header.Set("Location", "https://api.github.com/repositories/401025/pulls/7")
 					return response, nil
-				case "/repositories/401025/pulls/7":
-					if r.Method == http.MethodPatch && command == "edit" {
-						return restWriteResponse(http.StatusOK, canonical)
-					}
+				case "/repositories/401025":
 					if r.Method == http.MethodGet {
-						return restWriteResponse(http.StatusOK, canonical)
+						return restWriteResponse(http.StatusOK, `{"full_name":"mislav/hub"}`)
 					}
 				case "/repos/mislav/hub/issues/7/comments":
 					return restWriteResponse(http.StatusCreated, `{"html_url":"https://github.com/mislav/hub/pull/7#issuecomment-42"}`)
 				case "/repos/mislav/hub/pulls/7":
-					return restWriteResponse(http.StatusOK, strings.ReplaceAll(canonical, `"open"`, `"closed"`))
+					if r.Method == http.MethodPatch && command == "close" {
+						return restWriteResponse(http.StatusOK, strings.ReplaceAll(canonical, `"open"`, `"closed"`))
+					}
+					return restWriteResponse(http.StatusOK, canonical)
 				}
 				t.Errorf("unexpected %s %s", r.Method, r.URL.RequestURI())
 				return restWriteResponse(http.StatusNotFound, `{"message":"Not Found"}`)
@@ -591,4 +592,103 @@ func TestRESTPRWriteFollowsRepositoryRename(t *testing.T) {
 			assertNoRESTWriteChild(t, capture)
 		})
 	}
+}
+
+func TestRESTPRWriteRenameStopsBeforeForbiddenCanonicalWrite(t *testing.T) {
+	var requests []string
+	policy := strings.ReplaceAll(rewriteActiveTestPolicy, "internal-model", "mislav")
+	capture := restWriteFixture(t, policy, func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch r.URL.Path {
+		case "/repos/github/hub/pulls/7":
+			response, _ := restWriteResponse(http.StatusTemporaryRedirect, `{}`)
+			response.Header.Set("Location", "https://api.github.com/repositories/401025/pulls/7")
+			return response, nil
+		case "/repositories/401025":
+			if r.Method == http.MethodGet {
+				return restWriteResponse(http.StatusOK, `{"full_name":"mislav/hub"}`)
+			}
+		}
+		t.Errorf("canonical write %s %s", r.Method, r.URL.Path)
+		return restWriteResponse(http.StatusInternalServerError, `{}`)
+	})
+	var out, stderr bytes.Buffer
+	err := execRealGHWithStdin(t.Context(), []string{"pr", "edit", "7", "-R", "github/hub", "-b", "hello"}, nil, &out, &stderr)
+	if err == nil || out.Len() != 0 || !strings.Contains(stderr.String(), errRewriteBlocked.Error()) {
+		t.Fatalf("err=%v stdout=%q stderr=%q requests=%v", err, out.String(), stderr.String(), requests)
+	}
+	if !reflect.DeepEqual(requests, []string{"PATCH /repos/github/hub/pulls/7", "GET /repositories/401025"}) {
+		t.Fatalf("requests=%v", requests)
+	}
+	assertNoRESTWriteChild(t, capture)
+}
+
+func TestRESTPRWriteRenameHarness(t *testing.T) {
+	transcript := runRenameHarness(t, true)
+	t.Log("forbidden canonical\n" + transcript)
+	allowed := runRenameHarness(t, false)
+	t.Log("allowed rename\n" + allowed)
+	if !strings.Contains(transcript, "GET /repositories/401025") || !strings.Contains(transcript, "canonical writes=0") {
+		t.Fatalf("forbidden transcript:\n%s", transcript)
+	}
+	if strings.Contains(transcript, "PATCH /repos/mislav/hub/pulls/7") {
+		t.Fatalf("forbidden transcript replayed the write:\n%s", transcript)
+	}
+	if !strings.Contains(allowed, "PATCH /repos/mislav/hub/pulls/7") || !strings.Contains(allowed, "https://github.com/mislav/hub/pull/7") {
+		t.Fatalf("allowed transcript:\n%s", allowed)
+	}
+}
+
+func runRenameHarness(t *testing.T, forbid bool) string {
+	t.Helper()
+	var lines []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lines = append(lines, r.Method+" "+r.URL.Path)
+		switch r.URL.Path {
+		case "/repos/github/hub/pulls/7":
+			w.Header().Set("Location", "https://api.github.com/repositories/401025/pulls/7")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		case "/repositories/401025":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"full_name":"mislav/hub"}`)
+		case "/repos/mislav/hub/pulls/7":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"number":7,"html_url":"https://github.com/mislav/hub/pull/7","title":"A title","state":"open","merged":false}`)
+		default:
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(server.Close)
+	previous := restGitHubAPIRoot
+	restGitHubAPIRoot = server.URL
+	t.Cleanup(func() { restGitHubAPIRoot = previous })
+	policy := stringRewritePolicy{}
+	if forbid {
+		var err error
+		policy, err = compileStringRewriteRules([]stringRewriteRule{{Pattern: "mislav", Replacement: "public"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := server.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	var out, stderr bytes.Buffer
+	err := (&restPRWrite{command: "edit", number: "7", repo: "github/hub", body: "hello"}).execute(t.Context(), client, "harness-token", policy, &out, &stderr)
+	var b strings.Builder
+	for _, line := range lines {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	if forbid {
+		if !errors.Is(err, errRewriteBlocked) {
+			t.Fatalf("err=%v stderr=%q", err, stderr.String())
+		}
+		fmt.Fprintf(&b, "result: %s\ncanonical writes=0\n", errRewriteBlocked.Error())
+		return b.String()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&b, "stdout: %s", out.String())
+	return b.String()
 }

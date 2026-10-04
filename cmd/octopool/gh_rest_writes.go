@@ -17,6 +17,10 @@ import (
 	"time"
 )
 
+// restGitHubAPIRoot is the production GitHub API. The rename harness points
+// it at a loopback server; callers do not set it from the environment.
+var restGitHubAPIRoot = "https://api.github.com"
+
 type restPRWrite struct {
 	command, number, repo string
 	body, bodyFile        string
@@ -168,7 +172,7 @@ func (write *restPRWrite) execute(ctx context.Context, client *http.Client, toke
 		if err != nil {
 			return err
 		}
-		if !write.acceptPR(pr, followed) {
+		if !write.acceptPR(pr, followed, policy) {
 			return errors.New("invalid GitHub REST pull request response")
 		}
 		pullPath = repoPath(write.repo, "pulls", write.number)
@@ -216,7 +220,7 @@ func (write *restPRWrite) execute(ctx context.Context, client *http.Client, toke
 	if err != nil {
 		return err
 	}
-	if !write.acceptPR(updated, followed) || write.command == "close" && updated.State != "closed" {
+	if !write.acceptPR(updated, followed, policy) || write.command == "close" && updated.State != "closed" {
 		return errors.New("invalid GitHub REST pull request response")
 	}
 	if write.command == "edit" {
@@ -232,16 +236,16 @@ func (write restPRWrite) validPR(pr restPRResponse) bool {
 	return strconv.FormatInt(pr.Number, 10) == write.number && strings.EqualFold(pr.URL, "https://github.com/"+write.repo+"/pull/"+write.number)
 }
 
-func (write *restPRWrite) acceptPR(pr restPRResponse, followed bool) bool {
+func (write *restPRWrite) acceptPR(pr restPRResponse, followed bool, policy stringRewritePolicy) bool {
 	if write.validPR(pr) {
 		return true
 	}
 	// A rename redirect is the only time the canonical html_url may differ
 	// from the repository the caller still has checked out.
-	return followed && write.adoptCanonical(pr) && write.validPR(pr)
+	return followed && write.adoptCanonical(pr, policy) && write.validPR(pr)
 }
 
-func (write *restPRWrite) adoptCanonical(pr restPRResponse) bool {
+func (write *restPRWrite) adoptCanonical(pr restPRResponse, policy stringRewritePolicy) bool {
 	if strconv.FormatInt(pr.Number, 10) != write.number {
 		return false
 	}
@@ -251,6 +255,14 @@ func (write *restPRWrite) adoptCanonical(pr restPRResponse) bool {
 		return false
 	}
 	repo := strings.TrimSuffix(strings.TrimPrefix(pr.URL, prefix), suffix)
+	if !validCanonicalRepo(repo) || restPolicyAllowsCanonical(policy, repo) != nil {
+		return false
+	}
+	write.repo = repo
+	return true
+}
+
+func validCanonicalRepo(repo string) bool {
 	owner, name, ok := strings.Cut(repo, "/")
 	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
 		return false
@@ -258,8 +270,24 @@ func (write *restPRWrite) adoptCanonical(pr restPRResponse) bool {
 	if strings.ContainsAny(repo, " \t?#%\\") || owner == "." || owner == ".." || name == "." || name == ".." {
 		return false
 	}
-	write.repo = repo
 	return true
+}
+
+func restPolicyAllowsCanonical(policy stringRewritePolicy, repo string) error {
+	if len(policy.Rules) == 0 {
+		return nil
+	}
+	for _, text := range []string{
+		repo,
+		"https://github.com/" + repo,
+		restGitHubAPIRoot + "/repos/" + repo,
+		"/repos/" + repo,
+	} {
+		if err := policy.checkStructural(text); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func restPRRequest(ctx context.Context, client *http.Client, token string, policy stringRewritePolicy, method, path string, payload map[string]string, expected int, result any) (bool, error) {
@@ -275,7 +303,7 @@ func restPRExchange(ctx context.Context, client *http.Client, token string, poli
 			return false, err
 		}
 	}
-	endpoint := "https://api.github.com" + path
+	endpoint := restGitHubAPIRoot + path
 	headers := map[string]string{"Accept": "application/vnd.github+json", "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"}
 	if len(policy.Rules) > 0 {
 		// Content is already rewritten. Check generated wire material without
@@ -322,7 +350,21 @@ func restPRExchange(ctx context.Context, client *http.Client, token string, poli
 	if resp.StatusCode != expected {
 		if allowFollow && restRedirectStatus(resp.StatusCode) {
 			if next, ok := restRenameLocation(resp.Header.Get("Location"), path); ok {
-				if _, err := restPRExchange(ctx, client, token, policy, method, next, payload, expected, result, false); err != nil {
+				// Learn the canonical owner/name before replaying. A numeric
+				// repository path does not contain the name the policy guards.
+				id, suffix, ok := restRenameParts(next)
+				if !ok {
+					return false, errors.New("invalid GitHub REST redirect")
+				}
+				repo, err := restCanonicalRepository(ctx, client, token, policy, id)
+				if err != nil {
+					return false, err
+				}
+				if err := restPolicyAllowsCanonical(policy, repo); err != nil {
+					return false, err
+				}
+				named := "/repos/" + repo + suffix
+				if _, err := restPRExchange(ctx, client, token, policy, method, named, payload, expected, result, false); err != nil {
 					return true, err
 				}
 				return true, nil
@@ -364,12 +406,35 @@ func restRenameLocation(location, originalPath string) (string, bool) {
 	if suffix == "" || !strings.HasSuffix(parsed.Path, suffix) || strings.Contains(parsed.Path, "//") {
 		return "", false
 	}
-	prefix := strings.TrimSuffix(parsed.Path, suffix)
-	id, ok := strings.CutPrefix(prefix, "/repositories/")
-	if !ok || id == "" || strings.Contains(id, "/") || !isDigits(id) {
+	if _, _, ok := restRenameParts(parsed.Path); !ok {
 		return "", false
 	}
 	return parsed.Path, true
+}
+
+func restRenameParts(path string) (id, suffix string, ok bool) {
+	suffix = restResourceSuffix(path)
+	if suffix == "" {
+		return "", "", false
+	}
+	id, ok = strings.CutPrefix(strings.TrimSuffix(path, suffix), "/repositories/")
+	if !ok || id == "" || strings.Contains(id, "/") || !isDigits(id) {
+		return "", "", false
+	}
+	return id, suffix, true
+}
+
+func restCanonicalRepository(ctx context.Context, client *http.Client, token string, policy stringRewritePolicy, id string) (string, error) {
+	var identity struct {
+		FullName string `json:"full_name"`
+	}
+	if _, err := restPRExchange(ctx, client, token, policy, http.MethodGet, "/repositories/"+id, nil, http.StatusOK, &identity, false); err != nil {
+		return "", err
+	}
+	if !validCanonicalRepo(identity.FullName) {
+		return "", errors.New("invalid GitHub repository identity")
+	}
+	return identity.FullName, nil
 }
 
 func restResourceSuffix(path string) string {
