@@ -531,3 +531,64 @@ func TestRESTPRWriteEffectiveChildEnvironment(t *testing.T) {
 		})
 	}
 }
+
+func TestRESTPRWriteFollowsRepositoryRename(t *testing.T) {
+	for _, command := range []string{"comment", "edit", "close"} {
+		t.Run(command, func(t *testing.T) {
+			var requests []string
+			capture := restWriteFixture(t, rewriteEmptyTestPolicy, func(r *http.Request) (*http.Response, error) {
+				requests = append(requests, r.Method+" "+r.URL.Path)
+				canonical := `{"number":7,"html_url":"https://github.com/mislav/hub/pull/7","title":"A title","state":"open","merged":false}`
+				switch r.URL.Path {
+				case "/repos/github/hub/pulls/7":
+					status := http.StatusTemporaryRedirect
+					if r.Method == http.MethodGet {
+						status = http.StatusMovedPermanently
+					}
+					response, _ := restWriteResponse(status, `{}`)
+					response.Header.Set("Location", "https://api.github.com/repositories/401025/pulls/7")
+					return response, nil
+				case "/repositories/401025/pulls/7":
+					if r.Method == http.MethodPatch && command == "edit" {
+						return restWriteResponse(http.StatusOK, canonical)
+					}
+					if r.Method == http.MethodGet {
+						return restWriteResponse(http.StatusOK, canonical)
+					}
+				case "/repos/mislav/hub/issues/7/comments":
+					return restWriteResponse(http.StatusCreated, `{"html_url":"https://github.com/mislav/hub/pull/7#issuecomment-42"}`)
+				case "/repos/mislav/hub/pulls/7":
+					return restWriteResponse(http.StatusOK, strings.ReplaceAll(canonical, `"open"`, `"closed"`))
+				}
+				t.Errorf("unexpected %s %s", r.Method, r.URL.RequestURI())
+				return restWriteResponse(http.StatusNotFound, `{"message":"Not Found"}`)
+			})
+			args := []string{"pr", command, "7", "-R", "github/hub", "-b", "renamed"}
+			if command == "close" {
+				args = []string{"pr", "close", "7", "-R", "github/hub"}
+			}
+			var out, stderr bytes.Buffer
+			if err := execRealGHWithStdin(t.Context(), args, nil, &out, &stderr); err != nil {
+				t.Fatalf("%v stderr=%q requests=%v", err, stderr.String(), requests)
+			}
+			switch command {
+			case "comment":
+				if out.String() != "https://github.com/mislav/hub/pull/7#issuecomment-42\n" {
+					t.Fatalf("stdout=%q requests=%v", out.String(), requests)
+				}
+			case "edit":
+				if out.String() != "https://github.com/mislav/hub/pull/7\n" {
+					t.Fatalf("stdout=%q requests=%v", out.String(), requests)
+				}
+			case "close":
+				if stderr.String() != "✓ Closed pull request mislav/hub#7 (A title)\n" {
+					t.Fatalf("stderr=%q requests=%v", stderr.String(), requests)
+				}
+			}
+			if strings.Contains(out.String()+stderr.String(), restWriteTestToken) {
+				t.Fatal("token was printed")
+			}
+			assertNoRESTWriteChild(t, capture)
+		})
+	}
+}

@@ -157,19 +157,22 @@ type restPRResponse struct {
 	Merged *bool  `json:"merged"`
 }
 
-func (write restPRWrite) execute(ctx context.Context, client *http.Client, token string, policy stringRewritePolicy, stdout, stderr io.Writer) error {
+func (write *restPRWrite) execute(ctx context.Context, client *http.Client, token string, policy stringRewritePolicy, stdout, stderr io.Writer) error {
 	pullPath := repoPath(write.repo, "pulls", write.number)
 	commentPath := repoPath(write.repo, "issues", write.number, "comments")
 	var pr restPRResponse
 	if write.command != "edit" {
 		// The issues endpoint also accepts ordinary issues. Prove this is a PR
 		// before commenting, and preserve native close's merged/closed no-ops.
-		if err := restPRRequest(ctx, client, token, policy, http.MethodGet, pullPath, nil, http.StatusOK, &pr); err != nil {
+		followed, err := restPRRequest(ctx, client, token, policy, http.MethodGet, pullPath, nil, http.StatusOK, &pr)
+		if err != nil {
 			return err
 		}
-		if !write.validPR(pr) {
+		if !write.acceptPR(pr, followed) {
 			return errors.New("invalid GitHub REST pull request response")
 		}
+		pullPath = repoPath(write.repo, "pulls", write.number)
+		commentPath = repoPath(write.repo, "issues", write.number, "comments")
 		if write.command == "close" {
 			if pr.Merged == nil || (pr.State != "open" && pr.State != "closed") {
 				return errors.New("invalid GitHub REST pull request state")
@@ -192,7 +195,7 @@ func (write restPRWrite) execute(ctx context.Context, client *http.Client, token
 		var comment struct {
 			URL string `json:"html_url"`
 		}
-		if err := restPRRequest(ctx, client, token, policy, http.MethodPost, commentPath, map[string]string{"body": write.body}, http.StatusCreated, &comment); err != nil {
+		if _, err := restPRRequest(ctx, client, token, policy, http.MethodPost, commentPath, map[string]string{"body": write.body}, http.StatusCreated, &comment); err != nil {
 			return err
 		}
 		id, ok := strings.CutPrefix(comment.URL, pr.URL+"#issuecomment-")
@@ -209,10 +212,11 @@ func (write restPRWrite) execute(ctx context.Context, client *http.Client, token
 		payload = map[string]string{"state": "closed"}
 	}
 	var updated restPRResponse
-	if err := restPRRequest(ctx, client, token, policy, http.MethodPatch, pullPath, payload, http.StatusOK, &updated); err != nil {
+	followed, err := restPRRequest(ctx, client, token, policy, http.MethodPatch, pullPath, payload, http.StatusOK, &updated)
+	if err != nil {
 		return err
 	}
-	if !write.validPR(updated) || write.command == "close" && updated.State != "closed" {
+	if !write.acceptPR(updated, followed) || write.command == "close" && updated.State != "closed" {
 		return errors.New("invalid GitHub REST pull request response")
 	}
 	if write.command == "edit" {
@@ -220,7 +224,7 @@ func (write restPRWrite) execute(ctx context.Context, client *http.Client, token
 		return err
 	}
 	repo := strings.TrimSuffix(strings.TrimPrefix(pr.URL, "https://github.com/"), "/pull/"+write.number)
-	_, err := fmt.Fprintf(stderr, "✓ Closed pull request %s\n", redactRESTWriteToken(fmt.Sprintf("%s#%s (%s)", repo, write.number, pr.Title), token))
+	_, err = fmt.Fprintf(stderr, "✓ Closed pull request %s\n", redactRESTWriteToken(fmt.Sprintf("%s#%s (%s)", repo, write.number, pr.Title), token))
 	return err
 }
 
@@ -228,13 +232,47 @@ func (write restPRWrite) validPR(pr restPRResponse) bool {
 	return strconv.FormatInt(pr.Number, 10) == write.number && strings.EqualFold(pr.URL, "https://github.com/"+write.repo+"/pull/"+write.number)
 }
 
-func restPRRequest(ctx context.Context, client *http.Client, token string, policy stringRewritePolicy, method, path string, payload map[string]string, expected int, result any) error {
+func (write *restPRWrite) acceptPR(pr restPRResponse, followed bool) bool {
+	if write.validPR(pr) {
+		return true
+	}
+	// A rename redirect is the only time the canonical html_url may differ
+	// from the repository the caller still has checked out.
+	return followed && write.adoptCanonical(pr) && write.validPR(pr)
+}
+
+func (write *restPRWrite) adoptCanonical(pr restPRResponse) bool {
+	if strconv.FormatInt(pr.Number, 10) != write.number {
+		return false
+	}
+	const prefix = "https://github.com/"
+	suffix := "/pull/" + write.number
+	if !strings.HasPrefix(pr.URL, prefix) || !strings.HasSuffix(pr.URL, suffix) {
+		return false
+	}
+	repo := strings.TrimSuffix(strings.TrimPrefix(pr.URL, prefix), suffix)
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return false
+	}
+	if strings.ContainsAny(repo, " \t?#%\\") || owner == "." || owner == ".." || name == "." || name == ".." {
+		return false
+	}
+	write.repo = repo
+	return true
+}
+
+func restPRRequest(ctx context.Context, client *http.Client, token string, policy stringRewritePolicy, method, path string, payload map[string]string, expected int, result any) (bool, error) {
+	return restPRExchange(ctx, client, token, policy, method, path, payload, expected, result, true)
+}
+
+func restPRExchange(ctx context.Context, client *http.Client, token string, policy stringRewritePolicy, method, path string, payload map[string]string, expected int, result any, allowFollow bool) (bool, error) {
 	var body []byte
 	if payload != nil {
 		var err error
 		body, err = json.Marshal(payload)
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 	endpoint := "https://api.github.com" + path
@@ -243,28 +281,28 @@ func restPRRequest(ctx context.Context, client *http.Client, token string, polic
 		// Content is already rewritten. Check generated wire material without
 		// applying replacement rules a second time or changing structural fields.
 		if err := policy.guardRequest(ghAPIRequest{method: method, path: path}); err != nil {
-			return err
+			return false, err
 		}
 		if err := policy.checkStructural(endpoint); err != nil {
-			return err
+			return false, err
 		}
 		for key, value := range payload {
 			if policy.check(key) != nil || policy.check(value) != nil {
-				return errRewriteBlocked
+				return false, errRewriteBlocked
 			}
 		}
 		if policy.check(string(body)) != nil {
-			return errRewriteBlocked
+			return false, errRewriteBlocked
 		}
 		for key, value := range headers {
 			if policy.checkStructural(key) != nil || policy.checkStructural(value) != nil {
-				return errRewriteBlocked
+				return false, errRewriteBlocked
 			}
 		}
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return errors.New("could not prepare GitHub REST request")
+		return false, errors.New("could not prepare GitHub REST request")
 	}
 	for key, value := range headers {
 		req.Header.Set(key, value)
@@ -274,14 +312,22 @@ func restPRRequest(ctx context.Context, client *http.Client, token string, polic
 	if err != nil {
 		// Transport errors can contain authentication material or arbitrary proxy
 		// responses. Report a fixed error, with no replay after an uncertain write.
-		return errors.New("GitHub REST request failed; the write may have been accepted")
+		return false, errors.New("GitHub REST request failed; the write may have been accepted")
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, rewriteMaxContent+1))
 	if err != nil || len(data) > rewriteMaxContent {
-		return errors.New("could not read GitHub REST response; the write may have been accepted")
+		return false, errors.New("could not read GitHub REST response; the write may have been accepted")
 	}
 	if resp.StatusCode != expected {
+		if allowFollow && restRedirectStatus(resp.StatusCode) {
+			if next, ok := restRenameLocation(resp.Header.Get("Location"), path); ok {
+				if _, err := restPRExchange(ctx, client, token, policy, method, next, payload, expected, result, false); err != nil {
+					return true, err
+				}
+				return true, nil
+			}
+		}
 		message := http.StatusText(resp.StatusCode)
 		var failure struct {
 			Message string `json:"message"`
@@ -289,12 +335,51 @@ func restPRRequest(ctx context.Context, client *http.Client, token string, polic
 		if json.Unmarshal(data, &failure) == nil && failure.Message != "" {
 			message = failure.Message
 		}
-		return fmt.Errorf("HTTP %d: %s (%s)", resp.StatusCode, redactRESTWriteToken(message, token), endpoint)
+		return false, fmt.Errorf("HTTP %d: %s (%s)", resp.StatusCode, redactRESTWriteToken(message, token), endpoint)
 	}
 	if json.Unmarshal(data, result) != nil {
-		return errors.New("invalid GitHub REST response; the write may have been accepted")
+		return false, errors.New("invalid GitHub REST response; the write may have been accepted")
 	}
-	return nil
+	return false, nil
+}
+
+func restRedirectStatus(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
+func restRenameLocation(location, originalPath string) (string, bool) {
+	parsed, err := url.Parse(location)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "api.github.com") {
+		return "", false
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path == "" || parsed.Path == originalPath {
+		return "", false
+	}
+	suffix := restResourceSuffix(originalPath)
+	if suffix == "" || !strings.HasSuffix(parsed.Path, suffix) || strings.Contains(parsed.Path, "//") {
+		return "", false
+	}
+	prefix := strings.TrimSuffix(parsed.Path, suffix)
+	id, ok := strings.CutPrefix(prefix, "/repositories/")
+	if !ok || id == "" || strings.Contains(id, "/") || !isDigits(id) {
+		return "", false
+	}
+	return parsed.Path, true
+}
+
+func restResourceSuffix(path string) string {
+	if idx := strings.Index(path, "/pulls/"); idx >= 0 {
+		return path[idx:]
+	}
+	if idx := strings.Index(path, "/issues/"); idx >= 0 {
+		return path[idx:]
+	}
+	return ""
 }
 
 func redactRESTWriteToken(text, token string) string {
