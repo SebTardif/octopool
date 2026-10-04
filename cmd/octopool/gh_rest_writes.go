@@ -438,11 +438,21 @@ func restCanonicalRepository(ctx context.Context, client *http.Client, token str
 }
 
 func restResourceSuffix(path string) string {
-	if idx := strings.Index(path, "/pulls/"); idx >= 0 {
-		return path[idx:]
+	// Owner or repository names may themselves be "pulls" or "issues".
+	// Skip the repository prefix, then take only a real resource tail.
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	var tail []string
+	switch {
+	case len(parts) >= 4 && parts[0] == "repos":
+		tail = parts[3:]
+	case len(parts) >= 3 && parts[0] == "repositories" && isDigits(parts[1]):
+		tail = parts[2:]
+	default:
+		return ""
 	}
-	if idx := strings.Index(path, "/issues/"); idx >= 0 {
-		return path[idx:]
+	suffix := "/" + strings.Join(tail, "/")
+	if strings.HasPrefix(suffix, "/pulls/") || strings.HasPrefix(suffix, "/issues/") {
+		return suffix
 	}
 	return ""
 }

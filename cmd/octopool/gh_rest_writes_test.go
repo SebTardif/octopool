@@ -594,6 +594,69 @@ func TestRESTPRWriteFollowsRepositoryRename(t *testing.T) {
 	}
 }
 
+func TestRESTResourceSuffixSkipsRepositoryName(t *testing.T) {
+	for _, test := range []struct{ path, want string }{
+		{"/repos/github/hub/pulls/7", "/pulls/7"},
+		{"/repos/acme/pulls/pulls/7", "/pulls/7"},
+		{"/repos/pulls/hub/pulls/7", "/pulls/7"},
+		{"/repos/issues/hub/issues/7/comments", "/issues/7/comments"},
+		{"/repos/acme/issues/issues/7/comments", "/issues/7/comments"},
+		{"/repositories/401025/pulls/7", "/pulls/7"},
+		{"/repositories/401025/issues/7/comments", "/issues/7/comments"},
+		{"/repos/acme/hub/contents/readme", ""},
+	} {
+		if got := restResourceSuffix(test.path); got != test.want {
+			t.Fatalf("%s suffix=%q want %q", test.path, got, test.want)
+		}
+	}
+	location, ok := restRenameLocation("https://api.github.com/repositories/401025/pulls/7", "/repos/acme/pulls/pulls/7")
+	if !ok || location != "/repositories/401025/pulls/7" {
+		t.Fatalf("location=%q ok=%v", location, ok)
+	}
+}
+
+func TestRESTPRWriteRenameRepoNamedPulls(t *testing.T) {
+	for _, test := range []struct {
+		repo, first string
+	}{
+		{"acme/pulls", "/repos/acme/pulls/pulls/7"},
+		{"issues/hub", "/repos/issues/hub/pulls/7"},
+	} {
+		t.Run(test.repo, func(t *testing.T) {
+			var requests []string
+			canonical := `{"number":7,"html_url":"https://github.com/` + test.repo + `/pull/7","title":"A title","state":"open","merged":false}`
+			capture := restWriteFixture(t, rewriteEmptyTestPolicy, func(r *http.Request) (*http.Response, error) {
+				requests = append(requests, r.Method+" "+r.URL.Path)
+				switch {
+				case r.URL.Path == test.first && len(requests) == 1:
+					response, _ := restWriteResponse(http.StatusTemporaryRedirect, `{}`)
+					response.Header.Set("Location", "https://api.github.com/repositories/401025/pulls/7")
+					return response, nil
+				case r.Method == http.MethodGet && r.URL.Path == "/repositories/401025":
+					return restWriteResponse(http.StatusOK, `{"full_name":"`+test.repo+`"}`)
+				case r.Method == http.MethodPatch && r.URL.Path == test.first:
+					return restWriteResponse(http.StatusOK, canonical)
+				default:
+					t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+					return restWriteResponse(http.StatusNotFound, `{"message":"Not Found"}`)
+				}
+			})
+			var out, stderr bytes.Buffer
+			if err := execRealGHWithStdin(t.Context(), []string{"pr", "edit", "7", "-R", test.repo, "-b", "renamed"}, nil, &out, &stderr); err != nil {
+				t.Fatalf("%v stderr=%q requests=%v", err, stderr.String(), requests)
+			}
+			if out.String() != "https://github.com/"+test.repo+"/pull/7\n" {
+				t.Fatalf("stdout=%q requests=%v", out.String(), requests)
+			}
+			want := []string{"PATCH " + test.first, "GET /repositories/401025", "PATCH " + test.first}
+			if !reflect.DeepEqual(requests, want) {
+				t.Fatalf("requests=%v", requests)
+			}
+			assertNoRESTWriteChild(t, capture)
+		})
+	}
+}
+
 func TestRESTPRWriteRenameStopsBeforeForbiddenCanonicalWrite(t *testing.T) {
 	var requests []string
 	policy := strings.ReplaceAll(rewriteActiveTestPolicy, "internal-model", "mislav")
