@@ -1,4 +1,5 @@
 import { requestTimeoutMs, responseCapBytes } from "./github-limits";
+import { escapeRegex } from "./github-html-utils";
 import { decodeURIComponentSafe, encodedPathSegments } from "./github-path";
 import {
   boundedPageSize,
@@ -136,12 +137,19 @@ function actionsRunListRequest(
     url.searchParams.set("query", query.search);
   }
   return htmlWebRequest(env, url.toString(), async (body, headers, status) => {
-    const parsed = parseActionsRunListHTML(
-      new TextDecoder().decode(body),
-      route.owner!,
-      route.repo!,
-    );
+    const html = new TextDecoder().decode(body);
+    const parsed = parseActionsRunListHTML(html, route.owner!, route.repo!);
     if (parsed === undefined) {
+      return undefined;
+    }
+    // GitHub answers a numeric id or a missing workflow name with HTTP 200 and
+    // "0 workflow runs". Trust that zero only when the page links the file.
+    if (
+      workflow !== undefined &&
+      parsed.total_count === 0 &&
+      parsed.workflow_runs.length === 0 &&
+      !workflowPageShowsFile(html, route.owner!, route.repo!, decodeURIComponentSafe(workflow))
+    ) {
       return undefined;
     }
     // actionsListQuery rejects requests above the public page's 25-card capacity.
@@ -182,6 +190,23 @@ function actionsRunListRequest(
       controller.abort();
     }
   });
+}
+
+const WORKFLOW_FILE_NAME = /^[A-Za-z0-9_.-]+\.ya?ml$/;
+
+function workflowPageShowsFile(
+  html: string,
+  owner: string,
+  repo: string,
+  workflow: string,
+): boolean {
+  if (!WORKFLOW_FILE_NAME.test(workflow)) {
+    return false;
+  }
+  const pattern = new RegExp(
+    `href="/${escapeRegex(owner)}/${escapeRegex(repo)}/blob/[^"]*/\\.github/workflows/${escapeRegex(workflow)}"`,
+  );
+  return pattern.test(html);
 }
 
 function needsRunEnrichment(run: Record<string, unknown>): boolean {

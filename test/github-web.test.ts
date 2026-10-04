@@ -655,6 +655,50 @@ describe("github web provider", () => {
     });
   });
 
+  it("does not trust a zero workflow run count unless the workflow file is linked", async () => {
+    const zero = "<strong>0 workflow runs</strong>";
+    const proof = `<a href="/openclaw/octopool/blob/main/.github/workflows/ci.yml">ci.yml</a>${zero}`;
+    const fetchMock = vi.fn(async (url: string) => {
+      const href = String(url);
+      if (href.endsWith("/actions/workflows/ci.yml")) return new Response(proof);
+      if (
+        href.endsWith("/actions/workflows/missing.yml") ||
+        href.endsWith("/actions/workflows/25016")
+      ) {
+        return new Response(zero);
+      }
+      return Response.json({ total_count: 3, workflow_runs: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const read = async (workflow: string) => {
+      const request = validateRelayRequest({
+        pool: "maintainers",
+        method: "GET",
+        path: `/repos/openclaw/octopool/actions/workflows/${workflow}/runs`,
+        query: { per_page: "20" },
+        headers: { "x-octopool-public-shape": "actions-summary-v1" },
+      });
+      return callGitHubWeb(env(), request, classifyRoute(request, policy));
+    };
+
+    const present = await read("ci.yml");
+    expect(present).toMatchObject({ backend: "web", body: { total_count: 0, workflow_runs: [] } });
+
+    const missing = await read("missing.yml");
+    expect(missing).toMatchObject({ backend: "github", body: { total_count: 3 } });
+
+    const numeric = await read("25016");
+    expect(numeric).toMatchObject({ backend: "github", body: { total_count: 3 } });
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([
+      "https://github.com/openclaw/octopool/actions/workflows/ci.yml",
+      "https://github.com/openclaw/octopool/actions/workflows/missing.yml",
+      "https://api.github.com/repos/openclaw/octopool/actions/workflows/missing.yml/runs?per_page=20",
+      "https://github.com/openclaw/octopool/actions/workflows/25016",
+      "https://api.github.com/repos/openclaw/octopool/actions/workflows/25016/runs?per_page=20",
+    ]);
+  });
+
   it("does not drop repeated Actions list filters in the exact API fallback", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(new Response("rate limited", { status: 403 }));
     vi.stubGlobal("fetch", fetchMock);
