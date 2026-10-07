@@ -203,8 +203,10 @@ function workflowPageShowsFile(
   if (!WORKFLOW_FILE_NAME.test(workflow)) {
     return false;
   }
+  // GitHub links the canonical owner/repo casing, which may differ from the request.
   const pattern = new RegExp(
     `href="/${escapeRegex(owner)}/${escapeRegex(repo)}/blob/[^"]*/\\.github/workflows/${escapeRegex(workflow)}"`,
+    "i",
   );
   return pattern.test(html);
 }

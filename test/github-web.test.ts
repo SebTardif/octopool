@@ -671,11 +671,11 @@ describe("github web provider", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const read = async (workflow: string) => {
+    const read = async (workflow: string, repository = "openclaw/octopool") => {
       const request = validateRelayRequest({
         pool: "maintainers",
         method: "GET",
-        path: `/repos/openclaw/octopool/actions/workflows/${workflow}/runs`,
+        path: `/repos/${repository}/actions/workflows/${workflow}/runs`,
         query: { per_page: "20" },
         headers: { "x-octopool-public-shape": "actions-summary-v1" },
       });
@@ -685,6 +685,12 @@ describe("github web provider", () => {
     const present = await read("ci.yml");
     expect(present).toMatchObject({ backend: "web", body: { total_count: 0, workflow_runs: [] } });
 
+    const mixedCase = await read("ci.yml", "OpenClaw/Octopool");
+    expect(mixedCase).toMatchObject({
+      backend: "web",
+      body: { total_count: 0, workflow_runs: [] },
+    });
+
     const missing = await read("missing.yml");
     expect(missing).toMatchObject({ backend: "github", body: { total_count: 3 } });
 
@@ -692,6 +698,7 @@ describe("github web provider", () => {
     expect(numeric).toMatchObject({ backend: "github", body: { total_count: 3 } });
     expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([
       "https://github.com/openclaw/octopool/actions/workflows/ci.yml",
+      "https://github.com/openclaw/Octopool/actions/workflows/ci.yml",
       "https://github.com/openclaw/octopool/actions/workflows/missing.yml",
       "https://api.github.com/repos/openclaw/octopool/actions/workflows/missing.yml/runs?per_page=20",
       "https://github.com/openclaw/octopool/actions/workflows/25016",

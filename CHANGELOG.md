@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Trust a zero-run public Actions workflow page only when it links the workflow file, so numeric workflow ids and missing workflow names fall back to the API instead of reporting an empty run list. Thanks @SebTardif.
+
 ## 0.9.6 - 2026-10-06
 
 ### Features
