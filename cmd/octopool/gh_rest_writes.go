@@ -199,13 +199,19 @@ func (write *restPRWrite) execute(ctx context.Context, client *http.Client, toke
 		var comment struct {
 			URL string `json:"html_url"`
 		}
-		if _, err := restPRRequest(ctx, client, token, policy, http.MethodPost, commentPath, map[string]string{"body": write.body}, http.StatusCreated, &comment); err != nil {
+		followed, err := restPRRequest(ctx, client, token, policy, http.MethodPost, commentPath, map[string]string{"body": write.body}, http.StatusCreated, &comment)
+		if err != nil {
 			return err
 		}
-		id, ok := strings.CutPrefix(comment.URL, pr.URL+"#issuecomment-")
-		if !ok || !isDigits(id) {
+		prURL, id, ok := strings.Cut(comment.URL, "#issuecomment-")
+		commentPR := pr
+		commentPR.URL = prURL
+		if !ok || !isDigits(id) || !write.acceptPR(commentPR, followed, policy) {
 			return errors.New("invalid GitHub REST comment response")
 		}
+		// A rename can happen after the preflight; close must use the new repo too.
+		pr = commentPR
+		pullPath = repoPath(write.repo, "pulls", write.number)
 		if write.command == "comment" {
 			_, err := fmt.Fprintln(stdout, redactRESTWriteToken(comment.URL, token))
 			return err
@@ -227,7 +233,7 @@ func (write *restPRWrite) execute(ctx context.Context, client *http.Client, toke
 		_, err := fmt.Fprintln(stdout, redactRESTWriteToken(updated.URL, token))
 		return err
 	}
-	repo := strings.TrimSuffix(strings.TrimPrefix(pr.URL, "https://github.com/"), "/pull/"+write.number)
+	repo := strings.TrimSuffix(strings.TrimPrefix(updated.URL, "https://github.com/"), "/pull/"+write.number)
 	_, err = fmt.Fprintf(stderr, "✓ Closed pull request %s\n", redactRESTWriteToken(fmt.Sprintf("%s#%s (%s)", repo, write.number, pr.Title), token))
 	return err
 }
@@ -403,10 +409,10 @@ func restRenameLocation(location, originalPath string) (string, bool) {
 		return "", false
 	}
 	suffix := restResourceSuffix(originalPath)
-	if suffix == "" || !strings.HasSuffix(parsed.Path, suffix) || strings.Contains(parsed.Path, "//") {
+	if suffix == "" || strings.Contains(parsed.Path, "//") {
 		return "", false
 	}
-	if _, _, ok := restRenameParts(parsed.Path); !ok {
+	if _, nextSuffix, ok := restRenameParts(parsed.Path); !ok || nextSuffix != suffix {
 		return "", false
 	}
 	return parsed.Path, true

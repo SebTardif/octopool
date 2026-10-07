@@ -615,6 +615,67 @@ func TestRESTResourceSuffixSkipsRepositoryName(t *testing.T) {
 	}
 }
 
+func TestRESTPRWriteRenameAfterPreflight(t *testing.T) {
+	for _, command := range []string{"comment", "close-comment", "close"} {
+		t.Run(command, func(t *testing.T) {
+			var requests []string
+			canonical := strings.ReplaceAll(restWritePRJSON, "acme/repo", "mislav/hub")
+			capture := restWriteFixture(t, rewriteEmptyTestPolicy, func(r *http.Request) (*http.Response, error) {
+				requests = append(requests, r.Method+" "+r.URL.Path)
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/repo/pulls/7":
+					return restWriteResponse(http.StatusOK, restWritePRJSON)
+				case r.Method != http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/acme/repo/"):
+					response, _ := restWriteResponse(http.StatusTemporaryRedirect, `{}`)
+					response.Header.Set("Location", "https://api.github.com/repositories/401025"+strings.TrimPrefix(r.URL.Path, "/repos/acme/repo"))
+					return response, nil
+				case r.Method == http.MethodGet && r.URL.Path == "/repositories/401025":
+					return restWriteResponse(http.StatusOK, `{"full_name":"mislav/hub"}`)
+				case r.Method == http.MethodPost && r.URL.Path == "/repos/mislav/hub/issues/7/comments":
+					return restWriteResponse(http.StatusCreated, strings.ReplaceAll(restWriteCommentJSON, "acme/repo", "mislav/hub"))
+				case r.Method == http.MethodPatch && r.URL.Path == "/repos/mislav/hub/pulls/7":
+					return restWriteResponse(http.StatusOK, strings.ReplaceAll(canonical, `"open"`, `"closed"`))
+				default:
+					t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+					return restWriteResponse(http.StatusNotFound, `{}`)
+				}
+			})
+			args := []string{"pr", "comment", "7", "-R", "acme/repo", "-b", "hello"}
+			want := []string{"GET /repos/acme/repo/pulls/7", "POST /repos/acme/repo/issues/7/comments", "GET /repositories/401025", "POST /repos/mislav/hub/issues/7/comments"}
+			wantOut, wantErr := "https://github.com/mislav/hub/pull/7#issuecomment-42\n", ""
+			if command != "comment" {
+				args = []string{"pr", "close", "7", "-R", "acme/repo"}
+				wantOut, wantErr = "", "✓ Closed pull request mislav/hub#7 (A title)\n"
+				if command == "close-comment" {
+					args = append(args, "-c", "hello")
+					want = append(want, "PATCH /repos/mislav/hub/pulls/7")
+				} else {
+					want = []string{"GET /repos/acme/repo/pulls/7", "PATCH /repos/acme/repo/pulls/7", "GET /repositories/401025", "PATCH /repos/mislav/hub/pulls/7"}
+				}
+			}
+			var out, stderr bytes.Buffer
+			if err := execRealGHWithStdin(t.Context(), args, nil, &out, &stderr); err != nil {
+				t.Fatalf("%v stderr=%q requests=%v", err, stderr.String(), requests)
+			}
+			if out.String() != wantOut || stderr.String() != wantErr || !reflect.DeepEqual(requests, want) {
+				t.Fatalf("stdout=%q stderr=%q requests=%v; want requests=%v", out.String(), stderr.String(), requests, want)
+			}
+			assertNoRESTWriteChild(t, capture)
+		})
+	}
+}
+
+func TestRESTRenameLocationRejectsDifferentResourceTail(t *testing.T) {
+	for _, test := range []struct{ path, location string }{
+		{"/repos/acme/repo/pulls/7", "https://api.github.com/repositories/401025/issues/9/pulls/7"},
+		{"/repos/acme/repo/issues/7/comments", "https://api.github.com/repositories/401025/pulls/9/issues/7/comments"},
+	} {
+		if location, ok := restRenameLocation(test.location, test.path); ok {
+			t.Errorf("accepted different resource tail: %s", location)
+		}
+	}
+}
+
 func TestRESTPRWriteRenameRepoNamedPulls(t *testing.T) {
 	for _, test := range []struct {
 		repo, first string
